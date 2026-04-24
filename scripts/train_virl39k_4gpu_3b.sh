@@ -41,8 +41,9 @@ python3 -m verl.trainer.main \
     data.filter_overlong_prompts=false \
     data.max_prompt_length=8192 \
     worker.rollout.max_num_batched_tokens=16384 \
-    data.rollout_batch_size=128 \
-    data.val_batch_size=128 \
+    worker.rollout.gpu_memory_utilization=0.4 \
+    data.rollout_batch_size=64 \
+    data.val_batch_size=64 \
     worker.actor.model.model_path="${MODEL_PATH}" \
     worker.actor.global_batch_size=64 \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
