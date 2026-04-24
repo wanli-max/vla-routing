@@ -128,6 +128,14 @@ class ActorConfig:
     """temperature for positive tokens"""
     tau_negative: float = 1.05
     """temperature for negative tokens"""
+    answer_chain_selected_layers: tuple[int, ...] = (-1,)
+    """decoder layers whose pre-attention hidden states are cached for answer-chain routing"""
+    answer_chain_local_window_size: int = 64
+    """number of preceding response tokens included in the local predecessor set"""
+    reasoning_loss_weight_clip_min: Optional[float] = 0.1
+    """lower bound for positive reasoning token weights used by PPO loss"""
+    reasoning_loss_weight_clip_max: Optional[float] = 5.0
+    """upper bound for positive reasoning token weights used by PPO loss"""
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)

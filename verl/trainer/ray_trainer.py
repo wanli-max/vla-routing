@@ -36,6 +36,7 @@ from ..protocol import DataProto, pad_dataproto_to_divisor, unpad_dataproto
 from ..single_controller.base import Worker
 from ..single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from ..single_controller.ray.base import create_colocated_worker_cls
+from ..utils.answer_localization import localize_answer_token_batch
 from ..utils import torch_functional as VF
 from ..utils.checkpoint import CHECKPOINT_TRACKER, find_latest_ckpt, remove_obsolete_ckpt
 from ..utils.logger import Tracker
@@ -153,6 +154,22 @@ def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma:
     data.batch["advantages"] = advantages
     data.batch["returns"] = returns
     return data
+
+
+def cache_answer_token_mask(
+    data: DataProto,
+    tokenizer: PreTrainedTokenizer,
+    reward_function_path: str,
+) -> DataProto:
+    localization = localize_answer_token_batch(
+        tokenizer=tokenizer,
+        responses=data.batch["responses"],
+        response_mask=data.batch["response_mask"],
+        reward_function_path=reward_function_path,
+        skip_special_tokens=True,
+    )
+    answer_token_mask = localization.token_masks.to(torch.float32)
+    return data.union(DataProto.from_dict(tensors={"answer_token_mask": answer_token_mask}))
 
 
 class RayPPOTrainer:
@@ -646,6 +663,15 @@ class RayPPOTrainer:
                         gamma=self.config.algorithm.gamma,
                         lam=self.config.algorithm.lam,
                     )
+                    batch = cache_answer_token_mask(
+                        data=batch,
+                        tokenizer=self.tokenizer,
+                        reward_function_path=self.config.worker.reward.reward_function,
+                    )
+
+                with timer("answer_chain", timing_raw):
+                    answer_chain_output = self.actor_rollout_ref_wg.compute_actor_answer_chain_weights(batch)
+                    batch = batch.union(answer_chain_output)
 
                 # update critic
                 if self.use_critic:
