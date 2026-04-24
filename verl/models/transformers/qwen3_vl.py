@@ -245,7 +245,12 @@ def qwen3_vl_base_forward(
     )
     kwargs.update(input_kwargs)  # avoid lora module to have multiple keyword arguments
     outputs = self.language_model(input_ids=None, **kwargs)
-    return Qwen3VLModelOutputWithPast(last_hidden_state=outputs.last_hidden_state)
+    return Qwen3VLModelOutputWithPast(
+        last_hidden_state=outputs.last_hidden_state,
+        past_key_values=getattr(outputs, "past_key_values", None),
+        hidden_states=getattr(outputs, "hidden_states", None),
+        attentions=getattr(outputs, "attentions", None),
+    )
 
 
 def qwen3_vl_model_forward(
@@ -255,7 +260,12 @@ def qwen3_vl_model_forward(
     **kwargs,
 ) -> "Qwen3VLCausalLMOutputWithPast":
     outputs = self.model(input_ids=input_ids, **kwargs)
-    hidden_states = outputs[0]
+    hidden_states = outputs.last_hidden_state
     logits = self.lm_head(hidden_states)
 
-    return Qwen3VLCausalLMOutputWithPast(logits=logits)
+    return Qwen3VLCausalLMOutputWithPast(
+        logits=logits,
+        past_key_values=getattr(outputs, "past_key_values", None),
+        hidden_states=getattr(outputs, "hidden_states", None),
+        attentions=getattr(outputs, "attentions", None),
+    )
