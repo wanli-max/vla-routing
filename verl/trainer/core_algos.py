@@ -407,6 +407,26 @@ def average_loss(
         raise NotImplementedError(f"Unknown mode: {mode}.")
 
 
+def clip_token_loss_weights(
+    token_loss_weights: torch.Tensor | None,
+    response_mask: torch.Tensor,
+    clip_min: float | None,
+    clip_max: float | None,
+) -> torch.Tensor | None:
+    if token_loss_weights is None or (clip_min is None and clip_max is None):
+        return token_loss_weights
+
+    weights = token_loss_weights.to(torch.float32)
+    positive_mask = (weights > 0) & response_mask.to(torch.bool)
+    if not torch.any(positive_mask):
+        return weights
+
+    min_value = clip_min if clip_min is not None else float("-inf")
+    max_value = clip_max if clip_max is not None else float("inf")
+    clipped_weights = weights.clamp(min=min_value, max=max_value)
+    return torch.where(positive_mask, clipped_weights, weights)
+
+
 def compute_policy_loss(
     old_log_probs: torch.Tensor,
     log_probs: torch.Tensor,
@@ -419,6 +439,10 @@ def compute_policy_loss(
     tau_negative: float,
     loss_type: Literal["default", "gspo", "gspo_token", "cispo", "sapo"],
     loss_avg_mode: Literal["token", "seq"],
+    token_loss_weights: torch.Tensor | None = None,
+    sequence_weight_mask: torch.Tensor | None = None,
+    token_loss_weight_clip_min: float | None = None,
+    token_loss_weight_clip_max: float | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute the clipped policy objective and related metrics for PPO.
@@ -504,7 +528,23 @@ def compute_policy_loss(
         final_pg_loss = torch.where(advantages < 0, clipped_pg_loss_lower, clipped_pg_loss_higher)
         metrics["pg_clipfrac_lower"] = (clipped_pg_loss_higher > pg_loss3).float() * (advantages < 0).float()
 
-    final_pg_loss = average_loss(final_pg_loss, response_mask, mode=loss_avg_mode)
+    if token_loss_weights is None:
+        final_pg_loss = average_loss(final_pg_loss, response_mask, mode=loss_avg_mode)
+    else:
+        token_loss_weights = clip_token_loss_weights(
+            token_loss_weights=token_loss_weights,
+            response_mask=response_mask,
+            clip_min=token_loss_weight_clip_min,
+            clip_max=token_loss_weight_clip_max,
+        )
+        response_lengths = response_mask.sum(dim=-1).clamp_min(1.0)
+        seq_loss = (final_pg_loss * token_loss_weights).sum(dim=-1) / response_lengths
+        if sequence_weight_mask is None:
+            final_pg_loss = seq_loss.mean()
+        else:
+            valid_mask = sequence_weight_mask.to(seq_loss.dtype).reshape(-1)
+            valid_count = valid_mask.sum().clamp_min(1.0)
+            final_pg_loss = (seq_loss * valid_mask).sum() / valid_count
     metrics = {k: VF.masked_mean(v, response_mask).detach().item() for k, v in metrics.items()}
     return final_pg_loss, metrics
 
