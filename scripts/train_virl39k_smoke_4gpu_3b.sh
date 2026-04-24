@@ -15,10 +15,13 @@ if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]] || [[ "${CUDA_VISIBLE_DEVICES:-}" 
     echo "[INFO] Converted CUDA_VISIBLE_DEVICES to: ${CUDA_VISIBLE_DEVICES}"
 fi
 
-EXPERIMENT_NAME=${1:-"virl39k_smoke_4gpu_3b"}
+BASE_EXPERIMENT_NAME=${1:-"virl39k_smoke_4gpu_3b"}
 MODEL_PATH=${2:-"Qwen/Qwen2.5-VL-3B-Instruct"}
 DATASET_ROOT=${3:-"/projects_vol/gp_boan/easyr1_assets/datasets/virl39k_mmk12_easyr1"}
 SMOKE_ROOT="/projects_vol/gp_boan/easyr1_assets/datasets/virl39k_mmk12_easyr1_smoke"
+RUN_TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+EXPERIMENT_NAME="${BASE_EXPERIMENT_NAME}_${RUN_TIMESTAMP}"
+TENSORBOARD_RUN_DIR="tensorboard_log/easy_r1/${EXPERIMENT_NAME}"
 
 TRAIN_FILES="${SMOKE_ROOT}/train"
 VAL_FILES="${SMOKE_ROOT}/val"
@@ -27,8 +30,10 @@ echo "============================================"
 echo "  ViRL39K Smoke Test - 4x GPU (3B)"
 echo "============================================"
 echo "  Experiment : ${EXPERIMENT_NAME}"
+echo "  Base name  : ${BASE_EXPERIMENT_NAME}"
 echo "  Model      : ${MODEL_PATH}"
 echo "  Data       : ${DATASET_ROOT}"
+echo "  TB run dir : ${TENSORBOARD_RUN_DIR}"
 echo "============================================"
 
 # Build smoke subset (8 train, 4 val)
@@ -74,3 +79,8 @@ python3 -m verl.trainer.main \
     trainer.val_freq=3 \
     trainer.save_freq=3 \
     2>&1 | tee "${EXPERIMENT_NAME}.log"
+
+echo "[FINISH] Smoke run completed successfully."
+echo "[FINISH] Experiment name: ${EXPERIMENT_NAME}"
+echo "[FINISH] TensorBoard dir: ${TENSORBOARD_RUN_DIR}"
+echo "[FINISH] Log file: ${EXPERIMENT_NAME}.log"
