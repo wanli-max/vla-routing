@@ -533,7 +533,8 @@ class DataParallelPPOActor(BasePPOActor):
         if len(self._answer_chain_hidden_state_cache) != len(data):
             raise RuntimeError("Cached answer-chain hidden states do not match the current batch size.")
 
-        micro_batches = data.split(self.config.micro_batch_size_per_device_for_experience)
+        micro_batch_size = max(int(self.config.micro_batch_size_per_device_for_experience), 1)
+        micro_batches = [data[start : start + micro_batch_size] for start in range(0, len(data), micro_batch_size)]
 
         weight_batches = []
         valid_mask_batches = []
