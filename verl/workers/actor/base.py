@@ -49,12 +49,6 @@ class BasePPOActor(ABC):
         """
         pass
 
-    @abstractmethod
-    def compute_answer_chain_weights(self, data: DataProto) -> DataProto:
-        """Compute answer-chain routing weights for the current batch."""
-        pass
-
-    @abstractmethod
     def update_policy(self, data: DataProto) -> dict[str, Any]:
         """Update the policy with an iterator of DataProto
 

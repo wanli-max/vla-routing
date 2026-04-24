@@ -28,7 +28,7 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from ...protocol import DataProto, batch_collate
-from ...trainer.core_algos import average_loss, clip_token_loss_weights, compute_kl, compute_policy_loss
+from ...trainer.core_algos import average_loss, compute_kl, compute_policy_loss
 from ...utils.answer_chain_support import compute_answer_chain_support_from_local_rows
 from ...utils import torch_functional as VF
 from ...utils.py_functional import append_to_dict
@@ -112,18 +112,6 @@ class DataParallelPPOActor(BasePPOActor):
                 return nested_model.layers
 
         raise RuntimeError("Unable to locate decoder layers for answer-chain routing.")
-
-    def _get_model_config(self):
-        for candidate in (
-            self.actor_module,
-            getattr(self.actor_module, "_fsdp_wrapped_module", None),
-            getattr(self.actor_module, "model", None),
-            getattr(getattr(self.actor_module, "_fsdp_wrapped_module", None), "model", None),
-        ):
-            config = getattr(candidate, "config", None)
-            if config is not None:
-                return config
-        raise RuntimeError("Unable to locate model config for actor module.")
 
     def _compute_response_span(self, attention_mask: torch.Tensor, response_mask: torch.Tensor) -> tuple[int, int]:
         sequence_width = attention_mask.size(0)
@@ -593,7 +581,6 @@ class DataParallelPPOActor(BasePPOActor):
         optional_select_keys = [
             "token_loss_weights",
             "answer_chain_valid_mask",
-            "answer_token_mask",
         ]
         select_keys.extend([key for key in optional_select_keys if key in data.batch])
         non_tensor_select_keys = ["multi_modal_inputs"]
@@ -648,34 +635,6 @@ class DataParallelPPOActor(BasePPOActor):
                         token_loss_weight_clip_max=getattr(self.config, "reasoning_loss_weight_clip_max", None),
                     )
 
-                    reasoning_weight_metrics = {}
-                    token_loss_weights = model_inputs.get("token_loss_weights")
-                    if token_loss_weights is not None:
-                        token_loss_weights = clip_token_loss_weights(
-                            token_loss_weights=token_loss_weights,
-                            response_mask=response_mask,
-                            clip_min=getattr(self.config, "reasoning_loss_weight_clip_min", None),
-                            clip_max=getattr(self.config, "reasoning_loss_weight_clip_max", None),
-                        )
-                        token_loss_weights = token_loss_weights.to(torch.float32)
-                        response_mask_float = response_mask.to(torch.float32)
-                        masked_weights = token_loss_weights * response_mask_float
-                        reasoning_weight_metrics = {
-                            "actor/reasoning_loss_weight_mean": VF.masked_mean(
-                                token_loss_weights, response_mask_float
-                            ).detach().item(),
-                            "actor/reasoning_loss_weight_nonzero_frac": VF.masked_mean(
-                                (token_loss_weights > 0).to(torch.float32), response_mask_float
-                            ).detach().item(),
-                            "actor/reasoning_loss_weight_seq_sum_mean": masked_weights.sum(dim=-1).mean().detach().item(),
-                            "actor/reasoning_loss_weight_seq_max_mean": masked_weights.max(dim=-1).values.mean().detach().item(),
-                        }
-                        answer_chain_valid_mask = model_inputs.get("answer_chain_valid_mask")
-                        if answer_chain_valid_mask is not None:
-                            reasoning_weight_metrics["actor/reasoning_loss_weight_valid_seq_frac"] = (
-                                answer_chain_valid_mask.to(torch.float32).mean().detach().item()
-                            )
-
                     if self.config.use_kl_loss and "ref_log_probs" in model_inputs:
                         ref_log_probs = model_inputs["ref_log_probs"]
                         kld = compute_kl(
@@ -696,8 +655,6 @@ class DataParallelPPOActor(BasePPOActor):
                     batch_metrics = {f"actor/{k}": v for k, v in pg_metrics.items()}
                     batch_metrics["actor/pg_loss"] = pg_loss.detach().item()
                     append_to_dict(metrics, batch_metrics)
-                    if reasoning_weight_metrics:
-                        append_to_dict(metrics, reasoning_weight_metrics)
 
                 grad_norm = self._optimizer_step()
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
