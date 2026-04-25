@@ -125,25 +125,34 @@ class DataParallelPPOActor(BasePPOActor):
         response_end = response_start + response_length
         return response_start, response_end
 
+    def _register_hidden_state_hooks(self) -> tuple[list, dict]:
+        decoder_layers = self._get_decoder_layers()
+        layer_indices = self._resolve_answer_chain_layer_indices(len(decoder_layers))
+        captured: dict[int, torch.Tensor] = {}
+        hooks = []
+        for hook_idx, layer_idx in enumerate(layer_indices):
+            def make_hook(i):
+                def hook(module, args, output):
+                    captured[i] = args[0].detach().to("cpu", dtype=torch.bfloat16)
+                return hook
+            hooks.append(decoder_layers[layer_idx].register_forward_hook(make_hook(hook_idx)))
+        return hooks, captured
+
     def _extract_selected_projected_query_key_states(
         self,
-        outputs: Any,
+        captured_hidden_states: dict,
+        device: torch.device,
         batch_size: int,
         seqlen: int,
         indices: Optional[torch.Tensor] = None,
         pad_size: int = 0,
         detach_to_cpu: bool = True,
     ) -> torch.Tensor:
-        hidden_states = getattr(outputs, "hidden_states", None)
-        if hidden_states is None:
-            raise RuntimeError("Hidden-state caching requested but the forward output did not include hidden_states.")
-
         decoder_layers = self._get_decoder_layers()
         layer_indices = self._resolve_answer_chain_layer_indices(len(decoder_layers))
-        cache_dtype = torch.bfloat16
         selected_layer_specs = []
-        for layer_index in layer_indices:
-            hidden_state = hidden_states[layer_index]
+        for idx, layer_index in enumerate(layer_indices):
+            hidden_state = captured_hidden_states[idx].to(device=device)
             if self.config.padding_free:
                 if indices is None:
                     raise RuntimeError("Padding-free hidden-state caching requires unpadding indices.")
@@ -359,6 +368,10 @@ class DataParallelPPOActor(BasePPOActor):
             multi_modal_inputs = {}
 
         cached_hidden_states = None
+        hooks: list = []
+        captured: dict = {}
+        if cache_selected_hidden_states:
+            hooks, captured = self._register_hidden_state_hooks()
 
         if self.config.padding_free:
             input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # (total_nnz, 1)
@@ -398,9 +411,11 @@ class DataParallelPPOActor(BasePPOActor):
                 position_ids=position_ids_rmpad,
                 **multi_modal_inputs,
                 use_cache=False,
-                output_hidden_states=cache_selected_hidden_states,
+                output_hidden_states=False,
                 return_dict=True,
             )  # prevent model thinks we are generating
+            for h in hooks:
+                h.remove()
             logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
             logits_rmpad.div_(temperature)
             # ((total_nnz / sp) + pad)
@@ -418,7 +433,8 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
             if cache_selected_hidden_states:
                 cached_hidden_states = self._extract_selected_projected_query_key_states(
-                    outputs=output,
+                    captured_hidden_states=captured,
+                    device=input_ids_rmpad.device,
                     batch_size=batch_size,
                     seqlen=seqlen,
                     indices=indices,
@@ -432,16 +448,19 @@ class DataParallelPPOActor(BasePPOActor):
                 position_ids=position_ids,
                 **multi_modal_inputs,
                 use_cache=False,
-                output_hidden_states=cache_selected_hidden_states,
+                output_hidden_states=False,
                 return_dict=True,
             )
+            for h in hooks:
+                h.remove()
             logits: torch.Tensor = output.logits
             logits.div_(temperature)
             logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
             log_probs = self.log_probs_from_logits(logits, responses)  # (bsz, response_length)
             if cache_selected_hidden_states:
                 cached_hidden_states = self._extract_selected_projected_query_key_states(
-                    outputs=output,
+                    captured_hidden_states=captured,
+                    device=input_ids.device,
                     batch_size=batch_size,
                     seqlen=seqlen,
                     detach_to_cpu=True,
