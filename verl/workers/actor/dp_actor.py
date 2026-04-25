@@ -130,7 +130,7 @@ class DataParallelPPOActor(BasePPOActor):
         response_end = response_start + response_length
         return response_start, response_end
 
-    def _extract_selected_hidden_states(
+    def _extract_selected_projected_query_key_states(
         self,
         outputs: Any,
         batch_size: int,
@@ -146,8 +146,7 @@ class DataParallelPPOActor(BasePPOActor):
         decoder_layers = self._get_decoder_layers()
         layer_indices = self._resolve_answer_chain_layer_indices(len(decoder_layers))
         cache_dtype = torch.bfloat16
-        cached_hidden_states = []
-
+        selected_layer_specs = []
         for layer_index in layer_indices:
             hidden_state = hidden_states[layer_index]
             if self.config.padding_free:
@@ -162,37 +161,15 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                 hidden_state = hidden_state.squeeze(0)
                 hidden_state = pad_input(hidden_states=hidden_state, indices=indices, batch=batch_size, seqlen=seqlen)
-            hidden_state = hidden_state.to(dtype=cache_dtype)
-            if detach_to_cpu:
-                hidden_state = hidden_state.detach().cpu()
-            cached_hidden_states.append(hidden_state)
-
-        return torch.stack(cached_hidden_states, dim=1)
-
-    def _project_selected_query_key_states(self, selected_hidden_states: torch.Tensor):
-        decoder_layers = self._get_decoder_layers()
-        layer_indices = self._resolve_answer_chain_layer_indices(len(decoder_layers))
-        if selected_hidden_states.size(1) != len(layer_indices):
-            raise RuntimeError("Cached hidden-state count does not match configured answer-chain layer count.")
-
-        projected_layers = []
-        selected_layer_specs = []
-        for cached_layer_index, layer_index in enumerate(layer_indices):
             decoder_layer = decoder_layers[layer_index]
-            selected_layer_specs.append(
-                (
-                    cached_layer_index,
-                    decoder_layer,
-                    decoder_layer.self_attn,
-                    selected_hidden_states[:, cached_layer_index],
-                )
-            )
+            selected_layer_specs.append((decoder_layer, decoder_layer.self_attn, hidden_state))
 
+        projected_layer_states = []
         with ExitStack() as stack:
-            for _, decoder_layer, _, _ in selected_layer_specs:
+            for decoder_layer, _, _ in selected_layer_specs:
                 stack.enter_context(FSDP.summon_full_params(decoder_layer, writeback=False, recurse=True))
 
-            for _, decoder_layer, attention_module, layer_hidden_states in selected_layer_specs:
+            for decoder_layer, attention_module, layer_hidden_states in selected_layer_specs:
                 if hasattr(decoder_layer, "input_layernorm"):
                     layer_hidden_states = decoder_layer.input_layernorm(layer_hidden_states)
                 query_states = attention_module.q_proj(layer_hidden_states)
@@ -218,8 +195,29 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                     key_states = key_states.repeat_interleave(num_heads // num_key_value_heads, dim=1)
 
-                projected_layers.append((query_states, key_states, head_dim))
+                projected_states = torch.stack(
+                    [query_states.to(cache_dtype), key_states.to(cache_dtype)],
+                    dim=1,
+                )
+                if detach_to_cpu:
+                    projected_states = projected_states.detach().cpu()
+                projected_layer_states.append(projected_states)
 
+        return torch.stack(projected_layer_states, dim=1)
+
+    def _unpack_cached_projected_query_key_states(self, cached_projected_states: torch.Tensor):
+        decoder_layers = self._get_decoder_layers()
+        layer_indices = self._resolve_answer_chain_layer_indices(len(decoder_layers))
+        if cached_projected_states.size(1) != len(layer_indices):
+            raise RuntimeError("Cached answer-chain layer count does not match configured layer count.")
+        if cached_projected_states.size(2) != 2:
+            raise RuntimeError("Cached answer-chain projected states must store query and key tensors.")
+
+        projected_layers = []
+        for cached_layer_index in range(cached_projected_states.size(1)):
+            query_states = cached_projected_states[:, cached_layer_index, 0]
+            key_states = cached_projected_states[:, cached_layer_index, 1]
+            projected_layers.append((query_states, key_states, query_states.size(-1)))
         return projected_layers
 
     def _build_local_predecessor_rows(
@@ -320,14 +318,14 @@ class DataParallelPPOActor(BasePPOActor):
 
         return predecessor_indices, predecessor_weights
 
-    def _compute_answer_chain_support_from_cached_hidden_states(
+    def _compute_answer_chain_support_from_cached_projected_states(
         self,
         attention_mask: torch.Tensor,
         response_mask: torch.Tensor,
         answer_token_mask: torch.Tensor,
-        selected_hidden_states: torch.Tensor,
+        cached_projected_states: torch.Tensor,
     ):
-        projected_layers = self._project_selected_query_key_states(selected_hidden_states)
+        projected_layers = self._unpack_cached_projected_query_key_states(cached_projected_states)
         predecessor_indices, predecessor_weights = self._build_local_predecessor_rows(
             projected_layers=projected_layers,
             attention_mask=attention_mask,
@@ -350,7 +348,7 @@ class DataParallelPPOActor(BasePPOActor):
         """
         Returns:
             log_probs: # (bs, response_len)
-            cached_hidden_states: optional tensor cached on CPU for answer-chain routing
+            cached_hidden_states: optional projected q/k states cached on CPU for answer-chain routing
         """
         input_ids = micro_batch["input_ids"]
         batch_size, seqlen = input_ids.shape
@@ -427,7 +425,7 @@ class DataParallelPPOActor(BasePPOActor):
             )
             log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
             if cache_selected_hidden_states:
-                cached_hidden_states = self._extract_selected_hidden_states(
+                cached_hidden_states = self._extract_selected_projected_query_key_states(
                     outputs=output,
                     batch_size=batch_size,
                     seqlen=seqlen,
@@ -450,7 +448,7 @@ class DataParallelPPOActor(BasePPOActor):
             logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
             log_probs = self.log_probs_from_logits(logits, responses)  # (bsz, response_length)
             if cache_selected_hidden_states:
-                cached_hidden_states = self._extract_selected_hidden_states(
+                cached_hidden_states = self._extract_selected_projected_query_key_states(
                     outputs=output,
                     batch_size=batch_size,
                     seqlen=seqlen,
@@ -474,7 +472,7 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @torch.no_grad()
-    def compute_log_prob(self, data: DataProto) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto) -> DataProto:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -490,13 +488,15 @@ class DataParallelPPOActor(BasePPOActor):
                 ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
 
         Returns:
-            torch.Tensor: the log_prob tensor
+            DataProto: contains old_log_probs and, when available, answer-chain routing outputs
         """
         self.actor_module.eval()
         self._clear_answer_chain_hidden_state_cache()
 
         temperature = data.meta_info["temperature"]
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses"]
+        optional_select_keys = ["response_mask", "answer_token_mask"]
+        select_keys.extend([key for key in optional_select_keys if key in data.batch])
         non_tensor_select_keys = ["multi_modal_inputs"]
 
         data = data.select(select_keys, non_tensor_select_keys)
@@ -508,7 +508,8 @@ class DataParallelPPOActor(BasePPOActor):
             batch_idx_list = None
 
         log_probs_lst = []
-        cached_hidden_state_batches = []
+        token_loss_weight_batches = []
+        answer_chain_valid_mask_batches = []
         if self.rank == 0:
             micro_batches = tqdm(micro_batches, desc="Compute log probs", position=1)
 
@@ -520,76 +521,51 @@ class DataParallelPPOActor(BasePPOActor):
                 cache_selected_hidden_states=True,
             )
             log_probs_lst.append(log_probs)
-            if cached_hidden_states is not None:
-                cached_hidden_state_batches.append(cached_hidden_states)
+            if (
+                cached_hidden_states is not None
+                and "response_mask" in model_inputs
+                and "answer_token_mask" in model_inputs
+            ):
+                support = self._compute_answer_chain_support_from_cached_projected_states(
+                    attention_mask=model_inputs["attention_mask"],
+                    response_mask=model_inputs["response_mask"],
+                    answer_token_mask=model_inputs["answer_token_mask"],
+                    cached_projected_states=cached_hidden_states.to(device=model_inputs["input_ids"].device),
+                )
+                token_loss_weight_batches.append(support.token_loss_weights)
+                answer_chain_valid_mask_batches.append(support.answer_chain_valid_mask)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
-        if cached_hidden_state_batches:
-            cached_hidden_states = torch.concat(cached_hidden_state_batches, dim=0)
-        else:
-            cached_hidden_states = None
 
         if self.config.dynamic_batching:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
-            if cached_hidden_states is not None:
-                cached_hidden_states = restore_dynamic_batch(cached_hidden_states, batch_idx_list)
+            if token_loss_weight_batches:
+                token_loss_weights = restore_dynamic_batch(torch.concat(token_loss_weight_batches, dim=0), batch_idx_list)
+                answer_chain_valid_mask = restore_dynamic_batch(
+                    torch.concat(answer_chain_valid_mask_batches, dim=0), batch_idx_list
+                )
+            else:
+                token_loss_weights = None
+                answer_chain_valid_mask = None
+        else:
+            if token_loss_weight_batches:
+                token_loss_weights = torch.concat(token_loss_weight_batches, dim=0)
+                answer_chain_valid_mask = torch.concat(answer_chain_valid_mask_batches, dim=0)
+            else:
+                token_loss_weights = None
+                answer_chain_valid_mask = None
 
-        self._answer_chain_hidden_state_cache = cached_hidden_states
+        output_tensors = {"old_log_probs": log_probs}
+        if token_loss_weights is not None and answer_chain_valid_mask is not None:
+            output_tensors["token_loss_weights"] = token_loss_weights
+            output_tensors["answer_chain_valid_mask"] = answer_chain_valid_mask
 
-        return log_probs
+        return DataProto.from_dict(tensors=output_tensors)
 
     @torch.no_grad()
     def compute_answer_chain_weights(self, data: DataProto) -> DataProto:
         self.actor_module.eval()
-        if self._answer_chain_hidden_state_cache is None:
-            raise RuntimeError("Answer-chain hidden-state cache is empty. compute_log_prob must run before answer-chain routing.")
-
-        select_keys = ["input_ids", "attention_mask", "response_mask", "answer_token_mask"]
-        non_tensor_select_keys = []
-
-        data = data.select(select_keys, non_tensor_select_keys)
-        if len(self._answer_chain_hidden_state_cache) != len(data):
-            raise RuntimeError("Cached answer-chain hidden states do not match the current batch size.")
-
-        micro_batch_size = max(int(self.config.micro_batch_size_per_device_for_experience), 1)
-        micro_batches = [data[start : start + micro_batch_size] for start in range(0, len(data), micro_batch_size)]
-
-        weight_batches = []
-        valid_mask_batches = []
-
-        if self.rank == 0:
-            micro_batches = tqdm(micro_batches, desc="Compute answer-chain weights", position=1)
-
-        batch_offset = 0
-        try:
-            for micro_batch in micro_batches:
-                model_inputs = micro_batch.batch
-                micro_batch_size = len(micro_batch)
-                selected_hidden_states = self._answer_chain_hidden_state_cache[
-                    batch_offset : batch_offset + micro_batch_size
-                ].to(device=model_inputs["input_ids"].device)
-                batch_offset += micro_batch_size
-
-                support = self._compute_answer_chain_support_from_cached_hidden_states(
-                    attention_mask=model_inputs["attention_mask"],
-                    response_mask=model_inputs["response_mask"],
-                    answer_token_mask=model_inputs["answer_token_mask"],
-                    selected_hidden_states=selected_hidden_states,
-                )
-                weight_batches.append(support.token_loss_weights)
-                valid_mask_batches.append(support.answer_chain_valid_mask)
-        finally:
-            self._clear_answer_chain_hidden_state_cache()
-
-        token_loss_weights = torch.concat(weight_batches, dim=0)
-        answer_chain_valid_mask = torch.concat(valid_mask_batches, dim=0)
-
-        return DataProto.from_dict(
-            tensors={
-                "token_loss_weights": token_loss_weights,
-                "answer_chain_valid_mask": answer_chain_valid_mask,
-            }
-        )
+        return DataProto.from_dict(tensors={})
 
     def update_policy(self, data: DataProto) -> dict[str, Any]:
         self.actor_module.train()

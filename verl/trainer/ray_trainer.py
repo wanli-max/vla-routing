@@ -623,6 +623,12 @@ class RayPPOTrainer:
                     with timer("reward", timing_raw):
                         reward_ref = self.reward_fn.compute_reward.remote(batch)
 
+                batch = cache_answer_token_mask(
+                    data=batch,
+                    tokenizer=self.tokenizer,
+                    reward_function_path=self.config.worker.reward.reward_function,
+                )
+
                 # recompute old_log_probs
                 with timer("old", timing_raw):
                     old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
@@ -663,15 +669,6 @@ class RayPPOTrainer:
                         gamma=self.config.algorithm.gamma,
                         lam=self.config.algorithm.lam,
                     )
-                    batch = cache_answer_token_mask(
-                        data=batch,
-                        tokenizer=self.tokenizer,
-                        reward_function_path=self.config.worker.reward.reward_function,
-                    )
-
-                with timer("answer_chain", timing_raw):
-                    answer_chain_output = self.actor_rollout_ref_wg.compute_actor_answer_chain_weights(batch)
-                    batch = batch.union(answer_chain_output)
 
                 # update critic
                 if self.use_critic:
