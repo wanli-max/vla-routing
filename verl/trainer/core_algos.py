@@ -537,14 +537,19 @@ def compute_policy_loss(
             clip_min=token_loss_weight_clip_min,
             clip_max=token_loss_weight_clip_max,
         )
-        response_lengths = response_mask.sum(dim=-1).clamp_min(1.0)
-        seq_loss = (final_pg_loss * token_loss_weights).sum(dim=-1) / response_lengths
-        if sequence_weight_mask is None:
-            final_pg_loss = seq_loss.mean()
+        response_mask_float = response_mask.to(final_pg_loss.dtype)
+        effective_token_weights = token_loss_weights.to(final_pg_loss.dtype) * response_mask_float
+
+        # Keep the original PPO aggregation semantics: only reweight token losses.
+        # If answer-chain routing is invalid for a sequence, fall back to the unweighted PPO loss.
+        if sequence_weight_mask is not None:
+            valid_seq_mask = sequence_weight_mask.to(torch.bool).reshape(-1, 1)
+            effective_token_weights = torch.where(valid_seq_mask, effective_token_weights, response_mask_float)
         else:
-            valid_mask = sequence_weight_mask.to(seq_loss.dtype).reshape(-1)
-            valid_count = valid_mask.sum().clamp_min(1.0)
-            final_pg_loss = (seq_loss * valid_mask).sum() / valid_count
+            zero_weight_seq = effective_token_weights.sum(dim=-1, keepdim=True) <= 0
+            effective_token_weights = torch.where(zero_weight_seq, response_mask_float, effective_token_weights)
+
+        final_pg_loss = average_loss(final_pg_loss * effective_token_weights, response_mask, mode=loss_avg_mode)
     metrics = {k: VF.masked_mean(v, response_mask).detach().item() for k, v in metrics.items()}
     return final_pg_loss, metrics
 
