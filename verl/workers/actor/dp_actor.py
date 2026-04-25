@@ -63,14 +63,10 @@ class DataParallelPPOActor(BasePPOActor):
         self.world_size = int(os.getenv("WORLD_SIZE", "1"))
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
-        self._answer_chain_hidden_state_cache: Optional[torch.Tensor] = None
         if config.use_torch_compile:
             self.log_probs_from_logits = torch.compile(VF.log_probs_from_logits, dynamic=True)
         else:
             self.log_probs_from_logits = VF.log_probs_from_logits
-
-    def _clear_answer_chain_hidden_state_cache(self) -> None:
-        self._answer_chain_hidden_state_cache = None
 
     def _get_answer_chain_window_size(self) -> int:
         return int(getattr(self.config, "answer_chain_local_window_size", 64))
@@ -491,7 +487,6 @@ class DataParallelPPOActor(BasePPOActor):
             DataProto: contains old_log_probs and, when available, answer-chain routing outputs
         """
         self.actor_module.eval()
-        self._clear_answer_chain_hidden_state_cache()
 
         temperature = data.meta_info["temperature"]
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses"]
@@ -561,11 +556,6 @@ class DataParallelPPOActor(BasePPOActor):
             output_tensors["answer_chain_valid_mask"] = answer_chain_valid_mask
 
         return DataProto.from_dict(tensors=output_tensors)
-
-    @torch.no_grad()
-    def compute_answer_chain_weights(self, data: DataProto) -> DataProto:
-        self.actor_module.eval()
-        return DataProto.from_dict(tensors={})
 
     def update_policy(self, data: DataProto) -> dict[str, Any]:
         self.actor_module.train()

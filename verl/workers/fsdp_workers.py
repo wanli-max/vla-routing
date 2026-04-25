@@ -660,30 +660,6 @@ class FSDPWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def compute_actor_answer_chain_weights(self, data: DataProto):
-        assert self._has_actor
-
-        self._process_multi_modal_inputs(data)
-        data = data.to(torch.cuda.current_device())
-
-        if self._use_param_offload:
-            load_fsdp_model(self.fsdp_module)
-
-        with self.ulysses_sharding_manager:
-            data = self.ulysses_sharding_manager.preprocess_data(data)
-            output = self.actor.compute_answer_chain_weights(data=data)
-            output = self.ulysses_sharding_manager.postprocess_data(output)
-
-        if self.world_size > 1:
-            self.fsdp_module._handle.reshard(True)
-
-        if self._use_param_offload:
-            offload_fsdp_model(self.fsdp_module)
-
-        output = output.to("cpu")
-        return output
-
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_probs(self, data: DataProto):
         assert self._has_ref
 
