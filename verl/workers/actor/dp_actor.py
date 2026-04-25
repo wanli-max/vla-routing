@@ -28,7 +28,7 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from ...protocol import DataProto, batch_collate
-from ...trainer.core_algos import average_loss, compute_kl, compute_policy_loss
+from ...trainer.core_algos import average_loss, build_effective_token_loss_weights, compute_kl, compute_policy_loss
 from ...utils.answer_chain_support import compute_answer_chain_support_from_local_rows
 from ...utils import torch_functional as VF
 from ...utils.py_functional import append_to_dict
@@ -659,7 +659,14 @@ class DataParallelPPOActor(BasePPOActor):
 
                     token_loss_weights = model_inputs.get("token_loss_weights")
                     if token_loss_weights is not None:
-                        token_loss_weights = token_loss_weights.to(torch.float32)
+                        token_loss_weights = build_effective_token_loss_weights(
+                            token_loss_weights=token_loss_weights,
+                            response_mask=response_mask,
+                            sequence_weight_mask=model_inputs.get("answer_chain_valid_mask"),
+                            clip_min=getattr(self.config, "reasoning_loss_weight_clip_min", None),
+                            clip_max=getattr(self.config, "reasoning_loss_weight_clip_max", None),
+                            dtype=torch.float32,
+                        )
                         response_mask_float = response_mask.to(torch.float32)
                         masked_weights = token_loss_weights * response_mask_float
                         valid_weights = token_loss_weights[response_mask_float > 0]

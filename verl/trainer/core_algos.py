@@ -424,6 +424,35 @@ def clip_token_loss_weights(
     return torch.where(response_mask_bool, clipped_weights, weights)
 
 
+def build_effective_token_loss_weights(
+    token_loss_weights: torch.Tensor,
+    response_mask: torch.Tensor,
+    sequence_weight_mask: torch.Tensor | None = None,
+    clip_min: float | None = None,
+    clip_max: float | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    if dtype is None:
+        dtype = token_loss_weights.dtype
+
+    response_mask_float = response_mask.to(dtype)
+    effective_token_weights = token_loss_weights.to(dtype) * response_mask_float
+
+    if sequence_weight_mask is not None:
+        valid_seq_mask = sequence_weight_mask.to(torch.bool).reshape(-1, 1)
+        effective_token_weights = torch.where(valid_seq_mask, effective_token_weights, response_mask_float)
+    else:
+        zero_weight_seq = effective_token_weights.sum(dim=-1, keepdim=True) <= 0
+        effective_token_weights = torch.where(zero_weight_seq, response_mask_float, effective_token_weights)
+
+    return clip_token_loss_weights(
+        token_loss_weights=effective_token_weights,
+        response_mask=response_mask,
+        clip_min=clip_min,
+        clip_max=clip_max,
+    )
+
+
 def compute_policy_loss(
     old_log_probs: torch.Tensor,
     log_probs: torch.Tensor,
