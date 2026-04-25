@@ -76,7 +76,7 @@ class DataParallelPPOActor(BasePPOActor):
         return int(getattr(self.config, "answer_chain_local_window_size", 64))
 
     def _resolve_answer_chain_layer_indices(self, num_layers: int) -> tuple[int, ...]:
-        configured_layers = getattr(self.config, "answer_chain_selected_layers", (-1,))
+        configured_layers = getattr(self.config, "answer_chain_selected_layers", (-1, -2, -4))
         if isinstance(configured_layers, int):
             configured_layers = (configured_layers,)
         if len(configured_layers) <= 0:
