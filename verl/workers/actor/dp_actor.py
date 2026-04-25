@@ -256,16 +256,17 @@ class DataParallelPPOActor(BasePPOActor):
 
             # Accumulate attention probabilities over layers — two batched ops per layer
             combined_probs = None
+            routing_matmul_dtype = torch.bfloat16
             for query_states, key_states, head_dim in projected_layers:
                 H = query_states.size(1)
                 scale = 1.0 / math.sqrt(head_dim)
 
                 # Queries for all response positions: (L, H, D)
-                q = query_states[batch_index, :, response_start:response_end, :].permute(1, 0, 2).to(torch.float32)
+                q = query_states[batch_index, :, response_start:response_end, :].permute(1, 0, 2).to(routing_matmul_dtype)
 
                 # Prompt attention: (L, H, P)
                 if P > 0:
-                    p_k = key_states[batch_index, :, prompt_indices, :].to(torch.float32)  # (H, P, D)
+                    p_k = key_states[batch_index, :, prompt_indices, :].to(routing_matmul_dtype)  # (H, P, D)
                     p_logits = torch.matmul(
                         q.permute(1, 0, 2),         # (H, L, D)
                         p_k.transpose(-1, -2),       # (H, D, P)
@@ -274,7 +275,7 @@ class DataParallelPPOActor(BasePPOActor):
                     p_logits = q.new_empty(L, H, 0)
 
                 # Window attention — gather local keys once, one batched matmul: (L, H, W)
-                k_resp = key_states[batch_index, :, response_start:response_end, :].to(torch.float32)  # (H, L, D)
+                k_resp = key_states[batch_index, :, response_start:response_end, :].to(routing_matmul_dtype)  # (H, L, D)
                 k_win = k_resp[:, w_safe.reshape(-1), :].view(H, L, W, head_dim).permute(1, 0, 2, 3)  # (L, H, W, D)
                 w_logits = torch.matmul(
                     q.unsqueeze(2),                 # (L, H, 1, D)
@@ -282,7 +283,7 @@ class DataParallelPPOActor(BasePPOActor):
                 ).squeeze(2) * scale                 # (L, H, W)
 
                 # Merge, mask padding, softmax, average heads: (L, P+W)
-                logits = torch.cat([p_logits, w_logits], dim=2)
+                logits = torch.cat([p_logits, w_logits], dim=2).to(torch.float32)
                 logits.masked_fill_(~padded_valid.unsqueeze(1), float("-inf"))
                 layer_probs = torch.softmax(logits, dim=-1).mean(dim=1).nan_to_num(0.0)  # (L, P+W)
                 combined_probs = layer_probs if combined_probs is None else combined_probs + layer_probs
